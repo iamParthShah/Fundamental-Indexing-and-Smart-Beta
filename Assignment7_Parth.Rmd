@@ -1,0 +1,802 @@
+---
+title: "Assignment7"
+author: "Parth Shah"
+date: "21/10/2021"
+output: html_document
+---
+## Importing Libraries
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(data.table)
+library(haven)
+library(tidyverse)
+library(tidyquant)
+library(tidyr)
+library(lubridate)
+library(naniar)
+library(readxl)
+library(plotly)
+library(scales)
+library(fredr)
+library(openxlsx)
+library(fredr)
+library(zoo)
+library(frenchdata)
+library(NMOF)
+library(datetimeutils)
+library(lme4)
+library(geckor)
+library(tibbletime)
+library(zeallot)
+library(sandwich)
+library(lmtest)
+library(tidyquant)
+
+```
+
+## Fama French Data 
+We extract fama french data.
+It contains the risk free interest rate, High minus low premium, small minus big premium, and market risk premium.
+```{r}
+french_data <- French(getwd(),dataset = "F-F_Research_Data_Factors_CSV.zip")
+
+french_data$DATE <- row.names(french_data)
+rownames(french_data) <- NULL
+french_data <- french_data %>% 
+  mutate(DATE = as.Date(DATE)) %>%
+  mutate(RF = as.numeric(RF),
+        HML = as.numeric(HML),
+        SMB = as.numeric(SMB),
+        MKTRF = as.numeric(`Mkt-RF`),
+        DATE = floor_date(DATE, unit = "month"))
+
+```
+
+## Defining functions
+```{r}
+getReturns <- function(yearly_portfolio_returns) {
+
+  cum_returns <- yearly_portfolio_returns %>%
+              group_by(quintiles) %>%
+              mutate(Eq_cum_returns = Eq_yearly_returns,
+                     Wtd_cum_return = Weighted_yearly_returns,
+                     market_cum_return = mkt_excess_return) %>%
+              select(c(year, quintiles,Eq_cum_returns, Wtd_cum_return, market_cum_return)) %>%
+              ungroup()
+}
+
+getRankedStocks <- function(data, variable) {
+    index_ranking <- data %>% drop_na(variable) %>%
+              mutate(fyear = as.Date(paste(fyear, 1, 1, sep = "-"))) %>% 
+              group_by(fyear) %>%  mutate(quintiles = ntile(!!sym(variable),5))
+}
+
+getRankedStocks_forcleandate <- function(data, variable) {
+    index_ranking <- data %>% drop_na(variable) %>%
+              group_by(fyear) %>%  mutate(quintiles = ntile(!!sym(variable),5))
+}
+
+calcCumRets <- function(index_ranking, yearly_returns,variable) {
+  yearly_data_ranked <- yearly_returns %>%
+                inner_join(index_ranking,  by = c("year" = "fyear", "CUSIP" = "cusip")) %>%
+                drop_na(quintiles) 
+  yearly_portfolio_returns <- yearly_data_ranked %>% 
+              drop_na(quintiles) %>%
+              select(c("year", "CUSIP", "cum_excess_return", "market_cum_return","cum_ln_ret" ,variable, "quintiles")) %>%
+              group_by(year, quintiles) %>%
+              summarise(Eq_yearly_returns = mean(cum_excess_return,na.rm=TRUE),
+                        mkt_excess_return = mean(market_cum_return, na.rm=TRUE),
+                        Weighted_yearly_returns = weighted.mean(cum_excess_return,!!sym(variable), na.rm = TRUE)) %>%
+              ungroup()
+  cum_returns <- yearly_portfolio_returns %>%
+              group_by(quintiles) %>%
+              mutate(Eq_cum_returns = cumprod(1+Eq_yearly_returns)-1,
+                     Wtd_cum_return = cumprod(1+Weighted_yearly_returns)-1,
+                     market_cum_return = cumprod(1+mkt_excess_return)-1) %>%
+              select(c(year, quintiles,Eq_cum_returns, Wtd_cum_return, market_cum_return)) %>%
+              ungroup()
+}
+
+data_plot = function(master_data_join, datatype) {
+  len <- dim(master_data_join)
+  plot <- master_data_join %>% plot_ly()
+  
+  for(i in seq_along(master_data_join)) {
+    if (i<2) {next} else{  
+      x <- plot %>% add_trace(x = ~year, y=master_data_join[[i]] ,mode = 'bar', name=colnames(master_data_join)[i])
+    }
+    plot <- x
+  }
+  
+  plot %>% 
+    layout(title     = datatype,
+         barmode   = 'relative',
+         xaxis     = list(title=''),
+         margin    = list(l = 75, r = 75, b = 50, t = 50, pad = 4),
+         xaxis     = list(title = ""),
+         yaxis     = list(side = 'left', title = "Returns", showgrid = TRUE, zeroline = TRUE, color = 'steelblue'),
+         legend = list(traceorder = 'reversed',orientation = "h"))
+}
+
+## to plot recession periods over a plot
+## taken from john regenstiens session
+recession_shade_fun <- function(color_chosen = "darkgray", start_date = "1970-01-01"){
+  "USREC" %>%
+  tq_get(get = "economic.data", from = start_date) %>%
+  rename(year = date)%>%
+  select(year, recession_flag = price) %>%
+  mutate(recession_label = case_when(recession_flag == 1 & lag(recession_flag == 0) ~ str_glue("{year(year)} recession"),
+         TRUE ~ NA_character_)) %>%
+  filter(recession_flag == 1) %>%
+  fill(recession_label, .direction = "down") %>%
+  group_by(recession_label) %>%
+  slice(1, n()) %>%
+  select(-recession_flag) %>%
+  mutate(start = case_when(year == min(year) ~ year,
+                           TRUE ~ NA_Date_),
+         end = case_when(year == max(year) ~ year,
+                         TRUE ~ NA_Date_),
+         end = lead(end)
+         ) %>%
+  filter(!is.na(start)) %>%
+  select(-year) %>%
+    geom_rect(data = .,
+            inherit.aes = F,
+            aes(xmin = start,
+                xmax = end,
+                ymin = -Inf,
+                ymax = +Inf),
+            fill = color_chosen,
+            alpha = 0.4)
+}
+
+plot_with_recession <- function(data, datatype) {
+  df <- melt(data ,  id.vars = 'year', variable.name = 'Portfolio')
+  df = df%>%
+    rename(Returns = value)%>%
+    drop_na(Returns)
+ggplot(df, aes(x = year, y = Returns, colour = Portfolio)) +
+  geom_line()+ recession_shade_fun() +theme_minimal()+
+  ggtitle(datatype)+ theme(plot.title = element_text(hjust = 0.5))
+  
+}
+```
+
+
+## Reading COMPUSTAT Data
+Using haven library to read SAS dataset of COMPUSTAT
+```{r}
+data_path <- "D:\\Data\\funda.sas7bdat"
+variables_path <- "D:\\Data\\required_variables.csv"
+variables_to_take <- read.csv(variables_path,header=FALSE)
+variables_list <- append(c('fyear', 'gvkey', 'tic','indfmt', 'conm' ,'scf', 'compst','sich','prcc_f','csho','re'),variables_to_take$V1) 
+compustat_data <- haven::read_sas(data_path, col_select = variables_list)
+
+compustat_data <- compustat_data %>% 
+  filter(compst != "AB", !(sich %in% 4900:4999),!(sich %in% 6000:6999)) %>%   # financial firms, regulated utilities and firms in major M$As
+  filter (scf != 4, scf != 5, scf != 6) %>%                                   # scf values filtered
+  drop_na(scf, at) %>%
+  filter(at != 0) %>%                                                         # filter to remove zero total assets
+  select(-c(compst,sich)) 
+
+```
+## Calculating Fundamental Ratios And Saving Again
+We add lags to the fundamental data as the data is relesead after a quarter of the actual realised results.
+We avoid lookahead bias by doing so.
+```{r}
+compstat_data_to_save <- compustat_data %>%
+  arrange(fyear) %>% group_by(cusip) %>%
+  mutate(book_val = lag(at),
+         investments = lag(ifelse(scf %in% c(1:3), capx+ivch+aqc+fuseo-sppe-siv, capx+ivch+aqc-sppe-siv-ivstch-ivaco)),
+         net_cashflow = lag(fincf + ivncf + oancf),
+         avg_at =  (at + ifelse(!is.na(lag(at)),lag(at),at))/2, 
+         roa = lag(oiadp/avg_at)) %>%
+  drop_na(investments,net_cashflow,revt,sale,dv,roa) %>%
+  mutate(cashflows_trailing = rollapplyr(net_cashflow, 5, mean, na.rm = TRUE, fill = NA),
+         revt_trailing = rollapplyr(lag(revt), 5, mean, na.rm = TRUE, fill = NA),
+         sale_trailing = rollapplyr(lag(sale), 5, mean, na.rm = TRUE, fill = NA),
+         div_trailing = rollapplyr(lag(dv), 5, mean, na.rm = TRUE, fill = NA),
+         investment_trailing = rollapplyr(investments,5, mean, na.rm = TRUE, fill = NA),
+         prof_trailing = rollapplyr(roa, 5, mean, na.rm = TRUE, fill = NA),
+         asset_turnover = lag(sale/avg_at),
+         altman = 1.2*(ifelse(at!=0,(act-lct)/at,NA))+1.4*(ifelse(at!=0,re/at,NA))+3.3*(ifelse(at!=0,oiadp/at,NA))+0.6*(ifelse(lt!=0,(prcc_f*csho)/lt,NA))+0.99*(ifelse(at!=0,sale/at,NA)),
+        ohlson=-1.32-0.407*ifelse(at!=0,log(at),NA)+6.03*(ifelse(at!=0,lt/at,NA))-1.43*(ifelse(at!=0,(act-lct)/at,NA))+0.0757*(ifelse(act!=0,lct/act,NA))-2.37*(ifelse(at!=0,ni/at,NA))-1.83*(ifelse(lt!=0,(pi+dp)/lt,NA))-1.72*(ifelse(lt>at,1,0))+0.285*(ifelse((ni<0) && (ifelse(is.na(lag(ni)),ni,lag(ni)))<0,1,0))-0.521*ifelse(is.na(lag(ni)),0,((ni-lag(ni))/(abs(ni)+abs(lag(ni)))))) %>%
+  select(c('fyear','cusip','mkvalt','conm','book_val', 'cashflows_trailing','revt_trailing','sale_trailing','div_trailing','investment_trailing','prof_trailing','asset_turnover',"net_cashflow", "revt", "sale", "at","altman","ohlson"))
+
+```
+
+## Reading Monthly CSRP Data
+We read the CRSP monthly data and perform the neccessary mutations. WE lag the data by one month to avoid any lookahead bias.
+```{r}
+compstat_saved <- compstat_data_to_save %>%        ## We only use CUSIP that are present in Compustat
+  mutate(cusip = str_sub(cusip,1,8)) %>%           ## Compustat ahs 9 digit cusip while CRSP has 8 digit cusip
+  filter(fyear >= 1971)
+    
+monthly_data <- fread("D:\\Data\\msf_new2.csv") %>% 
+  tibble() %>%
+  filter (SHRCD %in% c(10,11), DATE > 19710000) %>%
+  mutate(RET = as.numeric(RET)) %>%
+  drop_na(RET) %>%
+  mutate(DATE = as.Date(parse_date_time(DATE, orders = "Ymd")), DATE = floor_date(DATE, unit = "month"),
+         PRC = ABS(PRC)) %>%
+  inner_join(french_data) %>%
+  mutate(excess_return = RET,
+         mkt_excess_return = VWRETD,
+         year = year(DATE))%>%
+  arrange(DATE) %>%
+  group_by(CUSIP) %>%
+  mutate(excess_return = lag(excess_return),
+         mkt_excess_return = lag(mkt_excess_return),
+         ln_ret = lag(c(diff(log(PRC)),NA)))
+
+yearly_returns <- monthly_data %>%
+  ungroup() %>%
+  group_by(CUSIP,year) %>%
+  mutate(year = as.Date(paste(year, 1, 1, sep = "-"))) %>% 
+  summarise(market_cum_return = prod(1+mkt_excess_return)-1,
+            cum_excess_return = prod(1+excess_return)-1,
+            cum_ln_ret = sum(ln_ret)) %>% ungroup()
+```
+
+## Fundamental Indexing
+We calculate the rankings, cumulative returns for each rank pfolio, and plot in plotly as well as SHINY APP.
+```{r}
+rankandPlot <- function(compstat_saved, yearly_returns, variable){
+  
+  cum_returns <- getRankedStocks(compstat_saved, variable) %>%
+                calcCumRets(yearly_returns,variable)
+
+  cum_returns <- cum_returns %>% select(-c(Eq_cum_returns)) %>% pivot_wider(names_from = quintiles, values_from = Wtd_cum_return)
+  
+  plot_with_recession(cum_returns, paste(variable, " Based Portfolios"))
+  data_plot(cum_returns, paste(variable, " Based Portfolios"))
+  ## FOR SHINY APP UNCOMMENT THE BOTTOM PART
+  
+#   ui <- fluidPage(
+#   selectInput("choice", "Choose", choices = names(cum_returns), selected = NULL),
+#   plotlyOutput("graph")
+#   )
+# 
+#   server <- function(input, output, session){
+# 
+#   output$graph <- renderPlotly({
+#     plot_ly(cum_returns, x = ~year , y = ~get(input$choice), type = 'scatter', mode = 'markers')
+#   })
+# 
+# }
+}
+rankandPlot_forcleandate <- function(compstat_saved, yearly_returns, variable) {
+  
+  cum_returns <- getRankedStocks_forcleandate(compstat_saved, variable) %>%
+                calcCumRets(yearly_returns,variable) 
+
+  cum_returns <- cum_returns %>% select(-c(Eq_cum_returns)) %>% pivot_wider(names_from = quintiles, values_from = Wtd_cum_return)
+  
+  ## SHINY APP IMPLEMENTATION
+  ui <- fluidPage(
+  selectInput("choice", "Choose", choices = names(cum_returns), selected = NULL),
+  plotlyOutput("graph")
+  )
+
+  server <- function(input, output, session){
+
+  output$graph <- renderPlotly({
+    plot_ly(cum_returns, x = ~year , y = ~get(input$choice),  type = 'scatter', mode = 'markers')
+  })
+}
+
+shinyApp(ui, server)
+
+#data_plot(cum_returns, paste(variable, " Based Portfolios"))
+}
+
+rankandPlot(compstat_saved, yearly_returns, "book_val")
+rankandPlot(compstat_saved %>% filter(cashflows_trailing != 0), yearly_returns, "cashflows_trailing")
+rankandPlot(compstat_saved, yearly_returns, "revt_trailing")
+rankandPlot(compstat_saved, yearly_returns, "sale_trailing")
+rankandPlot(compstat_saved, yearly_returns, "div_trailing")
+rankandPlot(compstat_saved, yearly_returns, "investment_trailing")
+rankandPlot(compstat_saved, yearly_returns, "prof_trailing")
+rankandPlot(compstat_saved, yearly_returns, "asset_turnover")
+rankandPlot(compstat_saved, yearly_returns, "prof_trailing")
+rankandPlot(compstat_saved, yearly_returns, "asset_turnover")
+rankandPlot(compstat_saved, yearly_returns, "altman")
+rankandPlot(compstat_saved, yearly_returns, "ohlson")
+```
+
+## Analysis of Portfolio Returns
+This function returns the Annualized sharpe, std dev, skewness, kurtosis, information ratio's and so on, for each ranked protfolio.
+We calculate this using the tidyquant library functions.
+```{r}
+calcStats <-function(compstat_saved, yearly_returns, variable){
+  
+    cum_returns <- getRankedStocks(compstat_saved, variable) %>%
+      calcCumRets(yearly_returns,variable) %>%
+      getReturns()%>%
+      #select(-c(Eq_cum_returns)) %>% 
+      pivot_wider(names_from = quintiles, values_from = Wtd_cum_return) 
+    
+    r1<- cum_returns%>% select(c("year","1")) %>% distinct() %>% drop_na() %>% mutate(ret = `1`)%>%
+      tq_performance(Ra = ret, Rb = NULL, performance_fun = table.AnnualizedReturns)
+    r1_<- cum_returns%>% select(c("year","1")) %>% distinct() %>% drop_na() %>% mutate(ret = `1`)%>%
+    tq_performance(Ra = ret, Rb = NULL, performance_fun = table.Stats) %>% select(c(Skewness,Kurtosis))
+    r1__<- cum_returns%>% select(c("year","1","market_cum_return")) %>% filter(!is.na(`1`))%>% mutate(ret = `1`)%>%
+    tq_performance(Ra = ret, Rb = market_cum_return, performance_fun = table.InformationRatio)
+
+    r1<- cbind(r1,r1_,r1__)
+    
+    r2<- cum_returns%>% select(c("year","2")) %>% distinct() %>% drop_na() %>% mutate(ret = `2`)%>%
+      tq_performance(Ra = ret, Rb = NULL, performance_fun = table.AnnualizedReturns)
+    r2_<- cum_returns%>% select(c("year","2")) %>% distinct() %>% drop_na() %>% mutate(ret = `2`)%>%
+    tq_performance(Ra = ret, Rb = NULL, performance_fun = table.Stats) %>% select(c(Skewness,Kurtosis))
+    r2__<- cum_returns%>% select(c("year","2","market_cum_return")) %>% filter(!is.na(`2`))%>% mutate(ret = `2`)%>%
+    tq_performance(Ra = ret, Rb = market_cum_return, performance_fun = table.InformationRatio)
+    r2<- cbind(r2,r2_,r2__)
+    
+    r3<- cum_returns%>% select(c("year","3")) %>% distinct() %>% drop_na() %>% mutate(ret = `3`)%>%
+      tq_performance(Ra = ret, Rb = NULL, performance_fun = table.AnnualizedReturns)
+    r3_<- cum_returns%>% select(c("year","3")) %>% distinct() %>% drop_na() %>% mutate(ret = `3`)%>%
+    tq_performance(Ra = ret, Rb = NULL, performance_fun = table.Stats) %>% select(c(Skewness,Kurtosis))
+    r3__<- cum_returns%>% select(c("year","3","market_cum_return")) %>% filter(!is.na(`3`))%>% mutate(ret = `3`)%>%
+    tq_performance(Ra = ret, Rb = market_cum_return, performance_fun = table.InformationRatio)
+    r3<- cbind(r3,r3_,r3__)
+    
+    r4<- cum_returns%>% select(c("year","4")) %>% distinct() %>% drop_na() %>% mutate(ret = `4`)%>%
+      tq_performance(Ra = ret, Rb = NULL, performance_fun = table.AnnualizedReturns)
+    r4_<- cum_returns%>% select(c("year","4")) %>% distinct() %>% drop_na() %>% mutate(ret = `4`)%>%
+    tq_performance(Ra = ret, Rb = NULL, performance_fun = table.Stats) %>% select(c(Skewness,Kurtosis))
+    r4__<- cum_returns%>% select(c("year","4","market_cum_return")) %>% filter(!is.na(`4`))%>% mutate(ret = `4`)%>%
+    tq_performance(Ra = ret, Rb = market_cum_return, performance_fun = table.InformationRatio)
+    r4<- cbind(r4,r4_,r4__)
+    
+    r5<- cum_returns%>% select(c("year","5")) %>% distinct() %>% drop_na() %>% mutate(ret = `5`)%>%
+      tq_performance(Ra = ret, Rb = NULL, performance_fun = table.AnnualizedReturns)
+    r5_<- cum_returns%>% select(c("year","5")) %>% distinct() %>% drop_na() %>% mutate(ret = `5`)%>%
+    tq_performance(Ra = ret, Rb = NULL, performance_fun = table.Stats) %>% select(c(Skewness,Kurtosis))
+    r5__<- cum_returns%>% select(c("year","5","market_cum_return")) %>% filter(!is.na(`5`))%>% mutate(ret = `5`)%>%
+    tq_performance(Ra = ret, Rb = market_cum_return, performance_fun = table.InformationRatio)
+    r5<- cbind(r5,r5_,r5__)
+    
+    r <- rbind(r1,r2,r3,r4,r5) 
+    
+    return(r)
+}
+
+x_bookval <-calcStats(compstat_saved, yearly_returns, "book_val")
+x_cashflow <-calcStats(compstat_saved %>% filter(cashflows_trailing != 0), yearly_returns, "cashflows_trailing")
+x_revenue <-calcStats(compstat_saved, yearly_returns, "revt_trailing")
+x_sale <- calcStats(compstat_saved, yearly_returns, "sale_trailing")
+#x_div <- calcStats(compstat_saved, yearly_returns, "div_trailing")
+x_inv <- calcStats(compstat_saved, yearly_returns, "investment_trailing")
+x_prof <- calcStats(compstat_saved, yearly_returns, "prof_trailing")
+x_asset <- calcStats(compstat_saved, yearly_returns, "asset_turnover")
+
+```
+
+## Functions for rolling beta and annualized vols 
+```{r}
+#Compute beta by cov/var method
+beta_compute <- function(x,y){
+  cov(x,y)/var(y)
+}
+
+beta_daily_function = function(data,x,y, col_name) {
+          
+    data <-  data %>% group_by(CUSIP,BK_START) %>%
+              summarise(Cor = cov(!!sym(x), !!sym(y))/var(!!sym(y)))
+    names(data)[3] = col_name
+    data
+}
+
+rolling_function = function(x,y,z,col_name){
+  if(col_name == "roll_beta"){
+      rolling <- rollify(function(x, y) {cov(x,y)/var(y)}, window = z)
+      return(rolling(x,y))
+  }
+  else if(col_name == "annualised_vol"){rolling <- rollify(function(x) {sd(x)*sqrt(12)}, window = z)
+  }
+  else{
+    rolling <- rollify(function(x) {sqrt(sum(x**2))},window = z)
+  }
+  return(rolling(x))
+}
+
+rolling_calculation <- function(data,window,col_name){
+  
+  stock_data_modified <- data%>% group_by(CUSIP)%>%
+    filter(n() >= window)%>%
+    arrange(DATE_START)%>%
+    mutate(!!col_name := lag(rolling_function(RET,VWRETD,window,!!col_name)))%>%
+    group_by(DATE_START)%>% 
+    filter(month(DATE_START)==1)%>%
+    drop_na(sym(col_name))
+  return(stock_data_modified)
+}
+
+```
+
+## Data for beta ranks
+Re-reading monthly data in new envirnoment, and performing neccessary mutations.
+```{r}
+monthly_data <- fread("D:\\Data\\msf_new2.csv") %>% tibble() %>%
+  filter(DATE>="19710000")
+
+monthly_data_modified = monthly_data%>%
+  arrange(CUSIP,DATE)%>%
+  drop_na(PRC)%>%
+  mutate(PRC = abs(PRC))%>%
+  filter(SHRCD %in% c(10,11))%>%
+  select(c(CUSIP,DATE,PRC,RET,VOL,SHROUT,VWRETD,SHRCD))%>%
+  mutate(DATE = as.Date(parse_date_time(DATE, orders = "Ymd")),MKTCAP = abs(PRC*SHROUT),DATE_START = floor_date(DATE, unit = "month"))%>%
+  mutate(across(c(RET),as.numeric))%>%
+  group_by(CUSIP)%>%
+  mutate(RET = PRC/lag(PRC)-1)%>%
+  distinct(DATE,.keep_all = TRUE)%>%
+  ungroup()
+
+```
+
+## Fama French Factors
+We have already read the fama french factor data. We download the momentum csv and read those factor and merge it with french_dt.
+```{r}
+french_dt <-french_Data%>%
+  mutate(DATE_START = as.Date(parse_date_time(DATE, orders = "Ym")))%>%
+  drop_na(DATE_START)%>%
+  mutate_if(is.character, as.numeric)
+
+mom_data = read.csv("D:\\Data\\F-F_Momentum_Factor.csv",skip = 12)
+names(mom_data)[1] = "DATE_START"
+mom_data = mom_data%>%
+  tibble()%>%
+  mutate(DATE_START = as.Date(parse_date_time(DATE_START, orders = "Ym")))%>%
+  drop_na(DATE_START)%>%
+  mutate_if(is.character, as.numeric)
+
+french_dt <- french_dt %>% merge(mom_data,by = "DATE_START")
+
+french_dt[,2:ncol(french_dt)] = french_dt[,2:ncol(french_dt)]/100
+
+monthly_data_modified_risk_free <- monthly_data_modified%>%
+  tibble()%>%
+  merge(french_dt,by = "DATE_START")%>%
+  drop_na(RET)%>%
+  arrange(CUSIP,DATE_START)
+
+monthly_data_modified_risk_free = monthly_data_modified_risk_free%>%
+  mutate(MKT = Mkt.RF+RF)%>%
+  select(-c(Mkt.RF))
+
+stock_data = monthly_data_modified_risk_free%>%
+  select(DATE_START,CUSIP,RET,VWRETD)
+
+beta_yearly = rolling_calculation(stock_data,12,"roll_beta")
+vol_yearly = rolling_calculation(stock_data,12,"annualised_vol")
+vol_yearly_squared = rolling_calculation(stock_data,12,"annualised_vol (Ri = 0)")
+```
+
+## Performing regression for each factor models
+
+```{r}
+calcRegression_for_4f<-function(data,frequency,col_name,target = c("VWRETD"),s = 3){
+  regression_data_1 = data%>%
+  mutate(value = floor_date(DATE_START, unit = frequency))%>%
+  select(-c(DATE_START))%>%
+  drop_na(RET)%>%
+  pivot_wider(names_from = CUSIP, values_from = c(RET),values_fill = 0)%>%
+  arrange(value)
+
+  names(regression_data_1) = c(target,value,paste0("CUSIP_",colnames(regression_data_1[s:ncol(regression_data_1)])))
+  depVars <- paste(c(colnames(regression_data_1[s:ncol(regression_data_1)])))
+  models = regression_data_1 %>% group_by(value) %>%
+    do(model = list(lm(formula(paste('cbind(',paste(depVars, collapse = ','),') ~ ',paste(target, collapse = '+'))),
+                       na.action = na.exclude ,data = .)))
+
+  mkt_beta = list(models$model[1][[1]][[1]]$coefficients[2,])
+
+  smb_beta = list(models$model[1][[1]][[1]]$coefficients[3,])
+  hml_beta = list(models$model[1][[1]][[1]]$coefficients[4,])
+
+  mom_beta = list(models$model[1][[1]][[1]]$coefficients[4,])
+
+  
+  k = models$model[1][[1]][[1]]$residuals
+  k1 = list(t(sqrt(colSums(k**2)*12/(12-length(target)-1))))
+  for (i in 2:nrow(models)){
+
+    mkt_beta = append(mkt_beta,list(models$model[i][[1]][[1]]$coefficients[2,]))
+    smb_beta = append(smb_beta,list(models$model[i][[1]][[1]]$coefficients[3,]))
+    hml_beta = append(hml_beta,list(models$model[i][[1]][[1]]$coefficients[4,]))
+
+    mom_beta = append(mom_beta,list(models$model[i][[1]][[1]]$coefficients[5,]))
+
+    k = models$model[i][[1]][[1]]$residuals
+    k1 = append(k1,list(t(sqrt(colSums(k**2)/(12-length(target)-1)))))
+  }
+  a = list()
+
+    mkt_beta  = as.tibble(do.call(rbind, mkt_beta))
+    mkt_beta = cbind(models$value,mkt_beta)
+    mkt_beta <- mkt_beta %>%
+      tibble()%>%
+      rename(value = "models$value")
+    names(mkt_beta)[1] = col_name
+    a = c(a,list(mkt_beta))
+    smb_beta  = as.tibble(do.call(rbind, smb_beta))
+    smb_beta = cbind(models$value,smb_beta)
+    smb_beta <- smb_beta %>%
+      tibble()%>%
+      rename(value = "models$value")
+    names(smb_beta)[1] = col_name
+    hml_beta  = as.tibble(do.call(rbind, hml_beta))
+    hml_beta = cbind(models$value,hml_beta) 
+    hml_beta <- hml_beta %>%
+      tibble()%>%
+      rename(value = "models$value")
+    names(hml_beta)[1] = col_name
+    a = c(a,list(smb_beta),list(hml_beta))
+    mom_beta  = as.tibble(do.call(rbind, mom_beta))
+    mom_beta = cbind(models$value,mom_beta) 
+    mom_beta <- mom_beta %>%
+      tibble()%>%
+      rename(value = "models$value")
+    names(mom_beta)[1] = col_name
+    a = c(a,list(mom_beta))
+
+  root_sq_error = as.tibble(do.call(rbind, k1))
+  root_sq_error = cbind(models$value,root_sq_error)
+
+  root_sq_error <- root_sq_error %>% tibble()%>% rename(value = "models$value")
+  names(root_sq_error)[1] = col_name
+  return(list(a,root_sq_error))
+}
+
+
+calcRegression_for_CAPM<-function(data,frequency,col_name,target = c("VWRETD")){
+  regression_data_1 = data%>%
+  mutate(value = floor_date(DATE_START, unit = frequency))%>%
+  select(-c(DATE_START))%>%
+  drop_na(RET)%>%
+  pivot_wider(names_from = CUSIP, values_from = c(RET),values_fill = 0)%>%
+  arrange(value)
+
+  names(regression_data_1) = c(target,value,paste0("CUSIP_",colnames(regression_data_1[s:ncol(regression_data_1)])))
+  depVars <- paste(c(colnames(regression_data_1[s:ncol(regression_data_1)])))
+  models = regression_data_1 %>% group_by(value) %>%
+    do(model = list(lm(formula(paste('cbind(',paste(depVars, collapse = ','),') ~ ',paste(target, collapse = '+'))),
+                       na.action = na.exclude ,data = .)))
+  mkt_beta = list(models$model[1][[1]][[1]]$coefficients[2,])
+  
+  k = models$model[1][[1]][[1]]$residuals
+  k1 = list(t(sqrt(colSums(k**2)*12/(12-length(target)-1))))
+  for (i in 2:nrow(models)){
+    mkt_beta = append(mkt_beta,list(models$model[i][[1]][[1]]$coefficients[2,]))
+
+    k = models$model[i][[1]][[1]]$residuals
+    k1 = append(k1,list(t(sqrt(colSums(k**2)/(12-length(target)-1)))))
+  }
+  a = list()
+  mkt_beta  = as.tibble(do.call(rbind, mkt_beta))
+  mkt_beta = cbind(models$value,mkt_beta)
+  mkt_beta <- mkt_beta %>%
+    tibble()%>%
+    rename(value = "models$value")
+  names(mkt_beta)[1] = col_name
+  a = c(a,list(mkt_beta))
+  
+  root_sq_error = as.tibble(do.call(rbind, k1))
+  root_sq_error = cbind(models$value,root_sq_error)
+
+  root_sq_error <- root_sq_error %>% tibble()%>% rename(value = "models$value")
+  names(root_sq_error)[1] = col_name
+  return(list(a,root_sq_error))
+}
+
+
+calcRegression_for_3f<-function(data,frequency,col_name,target = c("VWRETD"),s = 3){
+  regression_data_1 = data%>%
+  mutate(value = floor_date(DATE_START, unit = frequency))%>%
+  select(-c(DATE_START))%>%
+  drop_na(RET)%>%
+  pivot_wider(names_from = CUSIP, values_from = c(RET),values_fill = 0)%>%
+  arrange(value)
+
+  names(regression_data_1) = c(target,value,paste0("CUSIP_",colnames(regression_data_1[s:ncol(regression_data_1)])))
+  depVars <- paste(c(colnames(regression_data_1[s:ncol(regression_data_1)])))
+  models = regression_data_1 %>% group_by(value) %>%
+    do(model = list(lm(formula(paste('cbind(',paste(depVars, collapse = ','),') ~ ',paste(target, collapse = '+'))),
+                       na.action = na.exclude ,data = .)))
+
+  mkt_beta = list(models$model[1][[1]][[1]]$coefficients[2,])
+  smb_beta = list(models$model[1][[1]][[1]]$coefficients[3,])
+  hml_beta = list(models$model[1][[1]][[1]]$coefficients[4,])
+
+  
+  k = models$model[1][[1]][[1]]$residuals
+  k1 = list(t(sqrt(colSums(k**2)*12/(12-length(target)-1))))
+  for (i in 2:nrow(models)){
+
+    mkt_beta = append(mkt_beta,list(models$model[i][[1]][[1]]$coefficients[2,]))
+
+    smb_beta = append(smb_beta,list(models$model[i][[1]][[1]]$coefficients[3,]))
+    hml_beta = append(hml_beta,list(models$model[i][[1]][[1]]$coefficients[4,]))
+
+    k = models$model[i][[1]][[1]]$residuals
+    k1 = append(k1,list(t(sqrt(colSums(k**2)/(12-length(target)-1)))))
+  }
+  a = list()
+
+  mkt_beta  = as.tibble(do.call(rbind, mkt_beta))
+  mkt_beta = cbind(models$value,mkt_beta)
+  mkt_beta <- mkt_beta %>%
+    tibble()%>%
+    rename(value = "models$value")
+  names(mkt_beta)[1] = col_name
+  a = c(a,list(mkt_beta))
+  smb_beta  = as.tibble(do.call(rbind, smb_beta))
+  smb_beta = cbind(models$value,smb_beta)
+  smb_beta <- smb_beta %>%
+    tibble()%>%
+    rename(value = "models$value")
+  names(smb_beta)[1] = col_name
+  hml_beta  = as.tibble(do.call(rbind, hml_beta))
+  hml_beta = cbind(models$value,hml_beta) 
+  hml_beta <- hml_beta %>%
+    tibble()%>%
+    rename(value = "models$value")
+  names(hml_beta)[1] = col_name
+  a = c(a,list(smb_beta),list(hml_beta))
+
+
+  root_sq_error = as.tibble(do.call(rbind, k1))
+  root_sq_error = cbind(models$value,root_sq_error)
+
+  root_sq_error <- root_sq_error %>% tibble()%>% rename(value = "models$value")
+  names(root_sq_error)[1] = col_name
+  return(list(a,root_sq_error))
+}
+```
+
+## Calling Regression function and storing CAPM Beta and RSE errors.
+```{r}
+c(capm_Beta,capm_RSE) %<-% 
+  calcRegression_for_CAPM((monthly_data_modified_risk_free%>%
+  select(DATE_START,CUSIP,RET,VWRETD)),"12month","YEAR_START")
+
+c(betas_ff3,rse_market_ff3) %<-% 
+  calcRegression_for_3f((monthly_data_modified_risk_free%>%
+  select(DATE_START,CUSIP,RET,SMB,HML,VWRETD)),"12month","YEAR_START",c("VWRETD","SMB","HML"))
+
+c(betas_ff4,rse_market_ff4) %<-% 
+  calcRegression_for_4f((monthly_data_modified_risk_free%>%
+  select(DATE_START,CUSIP,RET,SMB,HML,VWRETD,Mom)),"12month","YEAR_START",c("VWRETD","SMB","HML","Mom"))
+
+c(beta_market_ff4,beta_smb_ff4,beta_hml_ff4,beta_mom_ff4) %<-% betas_ff4
+c(beta_market_ff3,beta_smb_ff3,beta_hml_ff3) %<-% betas_ff3
+beta_market_capm = capm_Beta[[1]]
+
+beta_market_capm_1 <- beta_market_capm %>% 
+  pivot_longer(!YEAR_START,names_to = "CUSIP",values_to = "beta_regression") %>% 
+  rename(DATE_START = YEAR_START) %>%
+  mutate(CUSIP = str_remove(CUSIP,"CUSIP_"))
+
+capm_RSE_1 <- capm_RSE %>% 
+  pivot_longer(!YEAR_START,names_to = "CUSIP",values_to = "IdioSyncratic Volatility for CAPM") %>% 
+  rename(DATE_START = YEAR_START) %>%
+  mutate(CUSIP = str_remove(CUSIP,"CUSIP_"))
+
+rse_ff3_1 <- rse_market_ff3 %>% 
+  pivot_longer(!YEAR_START,names_to = "CUSIP",values_to = "IdioSyncratic Volatility for 3 Factor Model") %>% 
+  rename(DATE_START = YEAR_START) %>%
+  mutate(CUSIP = str_remove(CUSIP,"CUSIP_"))
+
+rse_ff4_1 <- rse_market_ff4 %>% 
+  pivot_longer(!YEAR_START,names_to = "CUSIP",values_to = "IdioSyncratic Volatility for 4 Factor Model") %>% 
+  rename(DATE_START = YEAR_START) %>%
+  mutate(CUSIP = str_remove(CUSIP,"CUSIP_"))
+
+beta_joined_data <- beta_market_capm_1%>% merge(beta_yearly,by = c("DATE_START","CUSIP"))
+beta_joined_data <- capm_RSE_1%>% merge(beta_joined_data,by = c("DATE_START","CUSIP"))
+beta_joined_data <- rse_ff3_1%>% merge(beta_joined_data,by = c("DATE_START","CUSIP"))
+beta_joined_data <- rse_ff4_1%>% merge(beta_joined_data,by = c("DATE_START","CUSIP"))
+
+rankandPlot_forcleandate(beta_yearly %>% rename(fyear = DATE_START, cusip = CUSIP), yearly_returns, "roll_beta")
+rankandPlot_forcleandate(vol_yearly %>% rename(fyear = DATE_START, cusip = CUSIP), yearly_returns, "annualised_vol")
+rankandPlot_forcleandate(vol_yearly_squared %>% rename(fyear = DATE_START, cusip = CUSIP), yearly_returns, "annualised_vol (Ri = 0)")
+rankandPlot_forcleandate(beta_joined_data %>% rename(fyear = DATE_START, cusip = CUSIP), yearly_returns, "beta_regression")
+rankandPlot_forcleandate(beta_joined_data %>% rename(fyear = DATE_START, cusip = CUSIP), yearly_returns, "IdioSyncratic Volatility for CAPM")
+rankandPlot_forcleandate(beta_joined_data %>% rename(fyear = DATE_START, cusip = CUSIP), yearly_returns, "IdioSyncratic Volatility for 3 Factor Model")
+rankandPlot_forcleandate(beta_joined_data %>% rename(fyear = DATE_START, cusip = CUSIP), yearly_returns, "IdioSyncratic Volatility for 4 Factor Model")
+```
+
+## Analysis for beta based pfolios
+```{r}
+calcStats_forcleandate <-function(compstat_saved, yearly_returns, variable){
+  
+    cum_returns <- getRankedStocks_forcleandate(compstat_saved, variable) %>%
+      calcCumRets(yearly_returns,variable) %>%
+      getReturns()%>%
+      select(-c(Eq_cum_returns)) %>% 
+      pivot_wider(names_from = quintiles, values_from = Wtd_cum_return) 
+    
+    r1<- cum_returns%>% select(c("year","1")) %>% distinct() %>% drop_na() %>% mutate(ret = `1`)%>%
+      tq_performance(Ra = ret, Rb = NULL, performance_fun = table.AnnualizedReturns)
+    r1_<- cum_returns%>% select(c("year","1")) %>% distinct() %>% drop_na() %>% mutate(ret = `1`)%>%
+    tq_performance(Ra = ret, Rb = NULL, performance_fun = table.Stats) %>% select(c(Skewness,Kurtosis))
+    r1__<- cum_returns%>% select(c("year","1","market_cum_return")) %>% filter(!is.na(`1`))%>% mutate(ret = `1`)%>%
+    tq_performance(Ra = ret, Rb = market_cum_return, performance_fun = table.InformationRatio)
+
+    r1<- cbind(r1,r1_,r1__)
+    
+    
+    r2<- cum_returns%>% select(c("year","2")) %>% distinct() %>% drop_na() %>% mutate(ret = `2`)%>%
+      tq_performance(Ra = ret, Rb = NULL, performance_fun = table.AnnualizedReturns)
+    r2_<- cum_returns%>% select(c("year","2")) %>% distinct() %>% drop_na() %>% mutate(ret = `2`)%>%
+    tq_performance(Ra = ret, Rb = NULL, performance_fun = table.Stats) %>% select(c(Skewness,Kurtosis))
+    r2__<- cum_returns%>% select(c("year","2","market_cum_return")) %>% filter(!is.na(`2`))%>% mutate(ret = `2`)%>%
+    tq_performance(Ra = ret, Rb = market_cum_return, performance_fun = table.InformationRatio)
+    r2<- cbind(r2,r2_,r2__)
+    
+    r3<- cum_returns%>% select(c("year","3")) %>% distinct() %>% drop_na() %>% mutate(ret = `3`)%>%
+      tq_performance(Ra = ret, Rb = NULL, performance_fun = table.AnnualizedReturns)
+    r3_<- cum_returns%>% select(c("year","3")) %>% distinct() %>% drop_na() %>% mutate(ret = `3`)%>%
+    tq_performance(Ra = ret, Rb = NULL, performance_fun = table.Stats) %>% select(c(Skewness,Kurtosis))
+    r3__<- cum_returns%>% select(c("year","3","market_cum_return")) %>% filter(!is.na(`3`))%>% mutate(ret = `3`)%>%
+    tq_performance(Ra = ret, Rb = market_cum_return, performance_fun = table.InformationRatio)
+    r3<- cbind(r3,r3_,r3__)
+    
+    r4<- cum_returns%>% select(c("year","4")) %>% distinct() %>% drop_na() %>% mutate(ret = `4`)%>%
+      tq_performance(Ra = ret, Rb = NULL, performance_fun = table.AnnualizedReturns)
+    r4_<- cum_returns%>% select(c("year","4")) %>% distinct() %>% drop_na() %>% mutate(ret = `4`)%>%
+    tq_performance(Ra = ret, Rb = NULL, performance_fun = table.Stats) %>% select(c(Skewness,Kurtosis))
+    r4__<- cum_returns%>% select(c("year","4","market_cum_return")) %>% filter(!is.na(`4`))%>% mutate(ret = `4`)%>%
+    tq_performance(Ra = ret, Rb = market_cum_return, performance_fun = table.InformationRatio)
+    r4<- cbind(r4,r4_,r4__)
+    
+    r5<- cum_returns%>% select(c("year","5")) %>% distinct() %>% drop_na() %>% mutate(ret = `5`)%>%
+      tq_performance(Ra = ret, Rb = NULL, performance_fun = table.AnnualizedReturns)
+    r5_<- cum_returns%>% select(c("year","5")) %>% distinct() %>% drop_na() %>% mutate(ret = `5`)%>%
+    tq_performance(Ra = ret, Rb = NULL, performance_fun = table.Stats) %>% select(c(Skewness,Kurtosis))
+    r5__<- cum_returns%>% select(c("year","5","market_cum_return")) %>% filter(!is.na(`5`))%>% mutate(ret = `5`)%>%
+    tq_performance(Ra = ret, Rb = market_cum_return, performance_fun = table.InformationRatio)
+    r5<- cbind(r5,r5_,r5__)
+    
+    r <- rbind(r1,r2,r3,r4,r5) 
+    
+    return(r)
+}
+
+x_beta <-calcStats_forcleandate(beta_yearly %>% rename(fyear = DATE_START, cusip = CUSIP), yearly_returns, "roll_beta")
+x_vol <-calcStats_forcleandate(vol_yearly %>% rename(fyear = DATE_START, cusip = CUSIP), yearly_returns, "annualised_vol")
+x_vol_0 <-calcStats_forcleandate(vol_yearly_squared %>% rename(fyear = DATE_START, cusip = CUSIP), yearly_returns, "annualised_vol (Ri = 0)")
+x_idio_capm <- calcStats_forcleandate(beta_joined_data %>% rename(fyear = DATE_START, cusip = CUSIP), yearly_returns, "IdioSyncratic Volatility for CAPM")
+x_idio_3f <- calcStats_forcleandate(beta_joined_data %>% rename(fyear = DATE_START, cusip = CUSIP), yearly_returns, "IdioSyncratic Volatility for 3 Factor Model")
+x_idio_4f <- calcStats_forcleandate(beta_joined_data %>% rename(fyear = DATE_START, cusip = CUSIP), yearly_returns, "IdioSyncratic Volatility for 3 Factor Model")
+
+```
+
+## SHINY APP TEMPLATE
+ui has prompts like choice which wait for user input.
+user input goes to the server and render plot according to the input variable.
+
+```{r}
+library(shiny)
+library(plotly)
+
+ui <- fluidPage(
+  selectInput("choice", "Choose", choices = names(beta_joined_data), selected = NULL),
+  plotlyOutput("graph")
+  )
+
+server <- function(input, output, session){
+
+  output$graph <- renderPlotly({
+    plot_ly(beta_joined_data, x = ~get(input$choice), y = ~RET, type = 'scatter', mode = 'markers')
+  })
+}
+
+shinyApp(ui, server)
+```
+
+
